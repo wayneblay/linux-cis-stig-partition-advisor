@@ -11,31 +11,32 @@ Run it:   python partition_advisor.py
 import math
 
 APP_TITLE = "Linux CIS & STIG Partitioning Advisor"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # --------------------------------------------------------------------------- #
 # Options
 # --------------------------------------------------------------------------- #
 
-DISTROS = {
-    "Red Hat Enterprise Linux (RHEL 8 / 9 / 10)": {
-        "family": "rhel",
-        "fs": "xfs",
-        "vg": "rhel",
-    },
-    "Rocky Linux / AlmaLinux / CentOS Stream": {
-        "family": "rhel",
-        "fs": "xfs",
-        "vg": "vg_os",
-    },
-    "Ubuntu Server (22.04 LTS / 24.04 LTS)": {
-        "family": "ubuntu",
-        "fs": "ext4",
-        "vg": "ubuntu-vg",
-    },
+STIG = "DISA STIG"
+CIS_L1 = "CIS Level 1 - Server"
+CIS_L2 = "CIS Level 2 - Server"
+STANDARDS = [STIG, CIS_L1, CIS_L2]
+
+# Hardening tool profile for each family and standard.
+#  RHEL family: OpenSCAP / scap-security-guide profile IDs
+#  Ubuntu:      Ubuntu Security Guide (usg) profile names
+PROFILES = {
+    "rhel":   {STIG: "stig", CIS_L1: "cis_server_l1", CIS_L2: "cis"},
+    "ubuntu": {STIG: "disa_stig", CIS_L1: "cis_level1_server", CIS_L2: "cis_level2_server"},
 }
 
-STORAGE_LVM = "LVM (recommended for STIG)"
+DISTROS = {
+    "Red Hat Enterprise Linux (RHEL 8 / 9 / 10)": {"family": "rhel", "fs": "xfs", "vg": "rhel"},
+    "Rocky Linux / AlmaLinux / CentOS Stream":    {"family": "rhel", "fs": "xfs", "vg": "vg_os"},
+    "Ubuntu Server (22.04 LTS / 24.04 LTS)":      {"family": "ubuntu", "fs": "ext4", "vg": "ubuntu-vg"},
+}
+
+STORAGE_LVM = "LVM (recommended)"
 STORAGE_STD = "Standard partitions"
 STORAGE_TYPES = [STORAGE_LVM, STORAGE_STD]
 
@@ -55,8 +56,12 @@ VOLUMES = [
     ("/var",           "var",            6.0, 30, None, "nodev,nosuid",        "Packages, databases, containers"),
     ("/var/tmp",       "var_tmp",        2.0,  3, 10.0, "nodev,nosuid,noexec", "Temporary files kept across reboots"),
     ("/var/log",       "var_log",        4.0,  8, 50.0, "nodev,nosuid,noexec", "System logs"),
-    ("/var/log/audit", "var_log_audit",  4.0,  6, 50.0, "nodev,nosuid,noexec", "auditd logs (STIG)"),
+    ("/var/log/audit", "var_log_audit",  4.0,  6, 50.0, "nodev,nosuid,noexec", "auditd logs"),
 ]
+
+# STIG wants audit storage for at least a week of records, so the audit
+# volume gets a bigger share of spare space.
+WEIGHT_OVERRIDES = {STIG: {"/var/log/audit": 12}}
 
 # Smallest size each volume may shrink to on undersized test/lab disks.
 LAB_MINIMUMS = {
@@ -83,40 +88,53 @@ def floor1(x):
 
 
 def swap_size(ram_gb):
-    """Swap sized from RAM, following Red Hat's guidance for systems without hibernation."""
-    if ram_gb <= 2:
-        size = ram_gb * 2
-    elif ram_gb <= 8:
-        size = ram_gb
-    else:
-        size = 4.0
-    return max(1.0, floor1(size))
+    """
+    Modern default: a small fixed swap as a safety cushion, not RAM-sized.
+    Servers rarely hibernate, and large swap mostly just delays an out-of-memory
+    situation while the system crawls.
+    """
+    return 2.0 if ram_gb < 16 else 4.0
 
 
-def minimum_disk(ram_gb):
+def requirement(standard, mount):
+    """Whether the chosen standard requires this mount point as its own filesystem."""
+    if mount in ("/boot/efi", "/boot", "swap", "/"):
+        return "-"
+    if standard == STIG:
+        return "Required"
+    if mount == "/tmp":
+        return "Required (L1)"
+    return "Required (L2)" if standard == CIS_L2 else "Recommended (L2)"
+
+
+def minimum_disk(ram_gb, swap_gb=None):
     """Smallest disk that gets every volume its normal minimum."""
-    return EFI_GB + BOOT_GB + swap_size(ram_gb) + sum(v[2] for v in VOLUMES)
+    swap = swap_size(ram_gb) if swap_gb is None else swap_gb
+    return EFI_GB + BOOT_GB + swap + sum(v[2] for v in VOLUMES)
 
 
-def absolute_minimum_disk():
-    """Smallest disk the app will lay out at all (test/lab use, 1 GB swap)."""
-    return EFI_GB + BOOT_GB + 1.0 + sum(LAB_MINIMUMS.values())
+def absolute_minimum_disk(swap_gb=1.0):
+    """Smallest disk the app will lay out at all (test/lab use)."""
+    return EFI_GB + BOOT_GB + min(swap_gb, 1.0) + sum(LAB_MINIMUMS.values())
 
 
-def _distribute(extra):
+def _distribute(extra, standard):
     """Hand out `extra` GB above each volume's minimum by weight, respecting caps."""
+    overrides = WEIGHT_OVERRIDES.get(standard, {})
+    weight_of = {v[0]: overrides.get(v[0], v[3]) for v in VOLUMES}
     alloc = {v[0]: v[2] for v in VOLUMES}
     active = list(VOLUMES)
     while extra > 1e-9 and active:
-        weights = sum(v[3] for v in active)
+        weights = sum(weight_of[v[0]] for v in active)
         handed_out = 0.0
         still_active = []
-        for mount, _lv, _mn, weight, cap, _opt, _purpose in active:
-            share = extra * weight / weights
+        for vol in active:
+            mount, cap = vol[0], vol[4]
+            share = extra * weight_of[mount] / weights
             if cap is not None and alloc[mount] + share >= cap:
                 share = cap - alloc[mount]
             else:
-                still_active.append((mount, _lv, _mn, weight, cap, _opt, _purpose))
+                still_active.append(vol)
             alloc[mount] += share
             handed_out += share
         extra -= handed_out
@@ -126,30 +144,36 @@ def _distribute(extra):
     return alloc
 
 
-def calculate(distro, storage, disk_gb, ram_gb):
+def calculate(distro, storage, disk_gb, ram_gb, standard=STIG, swap_gb=None):
     """
-    Build a partition plan. Returns a dict with:
-      rows      list of dicts (mount, size, kind, device, fs, options, purpose)
-      used      GB allocated
-      free      GB left unallocated
-      warnings  list of strings
-      notes     list of strings
-    Raises ValueError with a readable message if the inputs don't work.
+    Build a partition plan.
+
+    swap_gb: None picks the modern default from RAM; 0 means no swap.
+
+    Returns a dict with rows (mount, size, device, fs, options, purpose, req),
+    used, free, warnings, notes and the inputs. Raises ValueError with a
+    readable message if the inputs don't work.
     """
     if distro not in DISTROS:
         raise ValueError("Pick a Linux distribution.")
     if storage not in STORAGE_TYPES:
         raise ValueError("Pick a storage type.")
+    if standard not in STANDARDS:
+        raise ValueError("Pick a security standard.")
     if ram_gb <= 0:
         raise ValueError("RAM must be greater than 0 GB.")
+    if swap_gb is not None and swap_gb < 0:
+        raise ValueError("Swap can't be negative. Use 0 for no swap.")
 
     info = DISTROS[distro]
     lvm = storage == STORAGE_LVM
     fs = info["fs"]
     vg = info["vg"]
-    swap = swap_size(ram_gb)
+    auto_swap = swap_gb is None
+    requested_swap = swap_size(ram_gb) if auto_swap else floor1(swap_gb)
+    swap = requested_swap
 
-    floor_disk = absolute_minimum_disk()
+    floor_disk = absolute_minimum_disk(requested_swap)
     if disk_gb < floor_disk:
         raise ValueError(
             f"A {disk_gb:g} GB disk is too small to hold all the separate "
@@ -159,16 +183,18 @@ def calculate(distro, storage, disk_gb, ram_gb):
         )
 
     warnings = []
-    lab = disk_gb < minimum_disk(ram_gb)
+    lab = disk_gb < minimum_disk(ram_gb, requested_swap)
     reserve = 0.0
 
     if lab:
-        # Undersized disk: shrink swap and scale every volume between its
-        # lab minimum and its normal minimum.
+        # Undersized disk: shrink swap if needed and scale every volume
+        # between its lab minimum and its normal minimum.
         lab_total = sum(LAB_MINIMUMS.values())
         full_total = sum(v[2] for v in VOLUMES)
-        swap = max(1.0, min(swap, floor1(disk_gb * 0.10),
-                            floor1(disk_gb - EFI_GB - BOOT_GB - lab_total)))
+        swap = min(requested_swap,
+                   max(min(requested_swap, 1.0), floor1(disk_gb * 0.10)),
+                   floor1(disk_gb - EFI_GB - BOOT_GB - lab_total))
+        swap = max(0.0, swap)
         available = disk_gb - EFI_GB - BOOT_GB - swap
         t = max(0.0, min(1.0, (available - lab_total) / (full_total - lab_total)))
         alloc = {v[0]: LAB_MINIMUMS[v[0]] + t * (v[2] - LAB_MINIMUMS[v[0]])
@@ -186,56 +212,93 @@ def calculate(distro, storage, disk_gb, ram_gb):
                     f"(about {floor1(target):g} GB is recommended). A larger disk "
                     "gives you room to grow volumes later."
                 )
-        alloc = _distribute(extra)
+        alloc = _distribute(extra, standard)
 
     if disk_gb < RECOMMENDED_DISK_GB:
+        audit_risk = (" With STIG audit settings, a full audit volume can suspend "
+                      "or halt the system." if standard == STIG else "")
         warnings.append(
             f"TEST / LAB USE ONLY: {RECOMMENDED_DISK_GB}-60 GB is the practical minimum "
-            f"for a CIS or STIG server. This {disk_gb:g} GB plan keeps every required "
-            "partition and mount option, but the volumes are small. /var and "
-            "/var/log/audit can fill quickly, and with STIG audit settings a full "
-            "audit volume can suspend or halt the system."
+            f"for a {standard} server. This {disk_gb:g} GB plan keeps every required "
+            "partition and mount option, but the volumes are small and /var and "
+            f"/var/log/audit can fill quickly.{audit_risk}"
         )
-    if lab and swap < swap_size(ram_gb):
-        warnings.append(
-            f"Swap was reduced to {swap:g} GB to fit the disk "
-            f"({swap_size(ram_gb):g} GB is normal for {ram_gb:g} GB of RAM)."
-        )
+    if swap < requested_swap:
+        warnings.append(f"Swap was reduced from {requested_swap:g} GB to {swap:g} GB "
+                        "to fit the disk.")
 
     def device(lv_name):
         return f"{vg}/{lv_name}" if lvm else "partition"
 
-    def kind():
-        return "Logical volume" if lvm else "Partition"
-
+    efi_options = "umask=0077,nosuid" if standard == STIG else "umask=0077"
     rows = [
-        dict(mount="/boot/efi", size=EFI_GB, kind="Partition", device="partition",
-             fs="vfat", options="umask=0077", purpose="UEFI system partition"),
-        dict(mount="/boot", size=BOOT_GB, kind="Partition", device="partition",
-             fs=fs, options="nodev,nosuid", purpose="Kernels and bootloader"),
-        dict(mount="swap", size=swap, kind=kind(), device=device("swap"),
-             fs="swap", options="-", purpose=(f"Swap (reduced to fit disk)" if swap < swap_size(ram_gb)
-                      else f"Swap (sized for {ram_gb:g} GB RAM)")),
+        dict(mount="/boot/efi", size=EFI_GB, device="partition", fs="vfat",
+             options=efi_options, purpose="UEFI system partition"),
+        dict(mount="/boot", size=BOOT_GB, device="partition", fs=fs,
+             options="nodev,nosuid", purpose="Kernels and bootloader"),
     ]
+    if swap > 0:
+        if swap < requested_swap:
+            swap_purpose = "Swap (reduced to fit disk)"
+        elif auto_swap:
+            swap_purpose = "Swap (safety cushion)"
+        else:
+            swap_purpose = "Swap (your size)"
+        rows.append(dict(mount="swap", size=swap, device=device("swap"), fs="swap",
+                         options="-", purpose=swap_purpose))
     for mount, lv_name, _mn, _w, _cap, options, purpose in VOLUMES:
-        rows.append(dict(mount=mount, size=floor1(alloc[mount]), kind=kind(),
-                         device=device(lv_name), fs=fs, options=options,
-                         purpose=purpose))
+        rows.append(dict(mount=mount, size=floor1(alloc[mount]), device=device(lv_name),
+                         fs=fs, options=options, purpose=purpose))
+    for r in rows:
+        r["req"] = requirement(standard, r["mount"])
 
     used = round(sum(r["size"] for r in rows), 1)
     free = round(disk_gb - used, 1)
 
+    notes = _notes(info["family"], standard, lvm, vg, free, swap, auto_swap)
+
+    return dict(rows=rows, used=used, free=free, warnings=warnings, notes=notes,
+                disk=disk_gb, ram=ram_gb, distro=distro, storage=storage,
+                standard=standard, lvm=lvm, lab=disk_gb < RECOMMENDED_DISK_GB)
+
+
+def _notes(family, standard, lvm, vg, free, swap, auto_swap):
     notes = []
-    if info["family"] == "rhel":
+    profile = PROFILES[family][standard]
+
+    # What the standard asks for.
+    if standard == STIG:
+        notes.append("STIG: every partition above is required. Size /var/log/audit to "
+                     "hold at least a week of audit records; auditd must warn at 75% "
+                     "full and take action when the volume is full.")
+        notes.append("STIG also requires FIPS mode and encryption of data at rest "
+                     "(LUKS). Turn on disk encryption in the installer if your site "
+                     "requires it for this system.")
+    elif standard == CIS_L1:
+        notes.append("CIS Level 1: only /tmp must be its own partition. Separate /var, "
+                     "/var/tmp, /var/log, /var/log/audit and /home are Level 2 items, "
+                     "but they are kept here because adding them later is hard. "
+                     "Their mount options apply whenever the partition exists.")
+    else:
+        notes.append("CIS Level 2: /tmp, /var, /var/tmp, /var/log, /var/log/audit and "
+                     "/home must all be separate partitions with the options shown.")
+
+    # How to install and harden on this distro.
+    if family == "rhel":
         notes.append("Installer: in Anaconda choose Custom storage configuration and "
                      "create the mount points above.")
-        notes.append("Hardening: on the Security Policy screen pick the DISA STIG or "
-                     "CIS profile, or run OpenSCAP (scap-security-guide) after install.")
+        notes.append(f"Hardening: pick the {standard} profile on the installer's Security "
+                     f"Policy screen, or run OpenSCAP after install with profile "
+                     f"'{profile}' (oscap xccdf eval --remediate --profile {profile} "
+                     "with your release's ssg-*-ds.xml).")
     else:
         notes.append("Installer: in the Ubuntu installer choose Custom storage layout "
                      "and create the mount points above.")
-        notes.append("Hardening: the Ubuntu Security Guide (usg, part of Ubuntu Pro) "
-                     "can audit and apply the CIS and DISA STIG profiles.")
+        stig_note = (" Check that the DISA STIG profile is published for your Ubuntu "
+                     "release." if standard == STIG else "")
+        notes.append(f"Hardening: Ubuntu Security Guide (Ubuntu Pro): sudo pro enable usg, "
+                     f"sudo apt install usg, then sudo usg fix {profile}.{stig_note}")
+
     if lvm:
         lvm_note = (f"LVM: /boot/efi and /boot are plain partitions; everything else "
                     f"is a logical volume in volume group '{vg}'.")
@@ -246,28 +309,34 @@ def calculate(distro, storage, disk_gb, ram_gb):
     else:
         notes.append("Standard partitions: use a GPT partition table. Resizing later "
                      "is hard, so consider LVM if you can.")
-    notes.append("Also mount /dev/shm (tmpfs, not on disk) with nodev,nosuid,noexec.")
 
-    return dict(rows=rows, used=used, free=free, warnings=warnings, notes=notes,
-                disk=disk_gb, ram=ram_gb, distro=distro, storage=storage, lvm=lvm,
-                lab=disk_gb < RECOMMENDED_DISK_GB)
+    if swap == 0:
+        notes.append("No swap: fine for many servers with enough RAM, but the system "
+                     "has no cushion if memory runs out.")
+    elif auto_swap:
+        notes.append(f"Swap: {swap:g} GB is a modern default. Neither CIS nor STIG sets "
+                     "a swap size. Enter a size in the Swap box to override, or 0 for none.")
+    notes.append("Also mount /dev/shm (tmpfs, not on disk) with nodev,nosuid,noexec.")
+    return notes
 
 
 def plan_as_text(plan):
     """Plain-text version of a plan for copying and pasting."""
     lines = [
         f"{APP_TITLE} v{VERSION}",
+        f"Standard:     {plan['standard']}",
         f"Distribution: {plan['distro']}",
         f"Storage:      {plan['storage']}",
         f"Disk: {plan['disk']:g} GB   RAM: {plan['ram']:g} GB",
         "",
-        f"{'Mount point':<16}{'Size':>9}  {'Device':<24}{'FS':<6}{'Mount options':<22}Purpose",
-        "-" * 100,
+        f"{'Mount point':<16}{'Size':>9}  {'Device':<22}{'FS':<6}{'Mount options':<22}"
+        f"{'Requirement':<18}Purpose",
+        "-" * 118,
     ]
     for r in plan["rows"]:
-        lines.append(f"{r['mount']:<16}{r['size']:>6.1f} GB  {r['device']:<24}"
-                     f"{r['fs']:<6}{r['options']:<22}{r['purpose']}")
-    lines.append("-" * 100)
+        lines.append(f"{r['mount']:<16}{r['size']:>6.1f} GB  {r['device']:<22}"
+                     f"{r['fs']:<6}{r['options']:<22}{r['req']:<18}{r['purpose']}")
+    lines.append("-" * 118)
     free_label = "free in volume group" if plan["lvm"] else "unallocated"
     lines.append(f"Allocated {plan['used']:g} GB, {plan['free']:g} GB {free_label}.")
     lines.append("")
@@ -295,8 +364,8 @@ def run_gui():
 
     root = tk.Tk()
     root.title(f"{APP_TITLE} v{VERSION}")
-    root.geometry("980x640")
-    root.minsize(820, 520)
+    root.geometry("1080x720")
+    root.minsize(880, 580)
 
     state = {"plan": None}
 
@@ -304,29 +373,34 @@ def run_gui():
     frm_in = ttk.LabelFrame(root, text=" System configuration ", padding=10)
     frm_in.pack(fill="x", padx=10, pady=(10, 5))
 
-    ttk.Label(frm_in, text="Linux distribution:").grid(row=0, column=0, sticky="w", pady=4)
-    cmb_distro = ttk.Combobox(frm_in, values=list(DISTROS), state="readonly", width=44)
-    cmb_distro.current(0)
-    cmb_distro.grid(row=0, column=1, columnspan=3, sticky="w", padx=6, pady=4)
+    def combo(row, label, values):
+        ttk.Label(frm_in, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        cmb = ttk.Combobox(frm_in, values=values, state="readonly", width=44)
+        cmb.current(0)
+        cmb.grid(row=row, column=1, columnspan=5, sticky="w", padx=6, pady=4)
+        return cmb
 
-    ttk.Label(frm_in, text="Storage type:").grid(row=1, column=0, sticky="w", pady=4)
-    cmb_storage = ttk.Combobox(frm_in, values=STORAGE_TYPES, state="readonly", width=44)
-    cmb_storage.current(0)
-    cmb_storage.grid(row=1, column=1, columnspan=3, sticky="w", padx=6, pady=4)
+    cmb_standard = combo(0, "Security standard:", STANDARDS)
+    cmb_distro = combo(1, "Linux distribution:", list(DISTROS))
+    cmb_storage = combo(2, "Storage type:", STORAGE_TYPES)
 
-    ttk.Label(frm_in, text="Disk size (GB):").grid(row=2, column=0, sticky="w", pady=4)
-    ent_disk = ttk.Entry(frm_in, width=10)
-    ent_disk.insert(0, "60")
-    ent_disk.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+    def entry(col, label, default, pad_left):
+        ttk.Label(frm_in, text=label).grid(row=3, column=col, sticky="w",
+                                           padx=(pad_left, 0), pady=4)
+        ent = ttk.Entry(frm_in, width=8)
+        ent.insert(0, default)
+        ent.grid(row=3, column=col + 1, sticky="w", padx=6, pady=4)
+        return ent
 
-    ttk.Label(frm_in, text="RAM (GB):").grid(row=2, column=2, sticky="e", padx=(16, 0), pady=4)
-    ent_ram = ttk.Entry(frm_in, width=10)
-    ent_ram.insert(0, "8")
-    ent_ram.grid(row=2, column=3, sticky="w", padx=6, pady=4)
+    ent_disk = entry(0, "Disk size (GB):", "60", 0)
+    ent_ram = entry(2, "RAM (GB):", "8", 16)
+    ent_swap = entry(4, "Swap (GB):", "", 16)
+    ttk.Label(frm_in, text="blank = auto, 0 = none", foreground="#777777").grid(
+        row=3, column=6, sticky="w", pady=4)
 
     frm_btn = ttk.Frame(frm_in)
-    frm_btn.grid(row=0, column=4, rowspan=3, sticky="ne", padx=(30, 0))
-    frm_in.columnconfigure(4, weight=1)
+    frm_btn.grid(row=0, column=7, rowspan=4, sticky="ne", padx=(30, 0))
+    frm_in.columnconfigure(7, weight=1)
 
     # ---- Output ----------------------------------------------------------- #
     frm_out = ttk.LabelFrame(root, text=" Partition plan ", padding=10)
@@ -335,9 +409,10 @@ def run_gui():
     lbl_summary = ttk.Label(frm_out, text="", font=("Segoe UI", 10, "bold"))
     lbl_summary.pack(anchor="w", pady=(0, 6))
 
-    cols = ("mount", "size", "device", "fs", "options", "purpose")
-    headings = ("Mount point", "Size", "Device", "Filesystem", "Mount options", "Purpose")
-    widths = (120, 80, 170, 80, 160, 260)
+    cols = ("mount", "size", "device", "fs", "options", "req", "purpose")
+    headings = ("Mount point", "Size", "Device", "Filesystem", "Mount options",
+                "Requirement", "Purpose")
+    widths = (115, 75, 160, 75, 150, 115, 230)
 
     frm_tree = ttk.Frame(frm_out)
     frm_tree.pack(fill="both", expand=True)
@@ -352,19 +427,22 @@ def run_gui():
     sb.pack(side="right", fill="y")
     tree.tag_configure("free", foreground="#777777")
 
-    txt_notes = tk.Text(frm_out, height=9, wrap="word", relief="flat",
+    txt_notes = tk.Text(frm_out, height=11, wrap="word", relief="flat",
                         background=root.cget("background"), font=("Segoe UI", 9))
     txt_notes.pack(fill="x", pady=(8, 0))
     txt_notes.tag_configure("warn", foreground="#c0392b", font=("Segoe UI", 9, "bold"))
     txt_notes.configure(state="disabled")
 
     # ---- Actions ---------------------------------------------------------- #
-    def read_number(entry, label):
+    def read_number(ent, label, allow_blank=False, allow_zero=False):
+        text = ent.get().strip()
+        if allow_blank and text == "":
+            return None
         try:
-            value = float(entry.get().strip())
+            value = float(text)
         except ValueError:
-            raise ValueError(f"Enter a number for {label} (for example 60).")
-        if value <= 0:
+            raise ValueError(f"Enter a number for {label}.")
+        if value < 0 or (value == 0 and not allow_zero):
             raise ValueError(f"{label} must be greater than 0.")
         return value
 
@@ -372,7 +450,9 @@ def run_gui():
         try:
             disk = read_number(ent_disk, "disk size")
             ram = read_number(ent_ram, "RAM")
-            plan = calculate(cmb_distro.get(), cmb_storage.get(), disk, ram)
+            swap = read_number(ent_swap, "swap", allow_blank=True, allow_zero=True)
+            plan = calculate(cmb_distro.get(), cmb_storage.get(), disk, ram,
+                             cmb_standard.get(), swap)
         except ValueError as e:
             if not quiet:
                 messagebox.showwarning("Check your inputs", str(e))
@@ -382,17 +462,18 @@ def run_gui():
         tree.delete(*tree.get_children())
         for r in plan["rows"]:
             tree.insert("", "end", values=(r["mount"], f"{r['size']:.1f} GB", r["device"],
-                                           r["fs"], r["options"], r["purpose"]))
+                                           r["fs"], r["options"], r["req"], r["purpose"]))
         if plan["free"] > 0:
             label = "(free in VG)" if plan["lvm"] else "(unallocated)"
             tree.insert("", "end", tags=("free",),
-                        values=(label, f"{plan['free']:.1f} GB", "", "", "",
+                        values=(label, f"{plan['free']:.1f} GB", "", "", "", "",
                                 "Room to grow volumes later" if plan["lvm"] else ""))
 
         prefix = "TEST / LAB LAYOUT  ·  " if plan["lab"] else ""
-        lbl_summary.config(text=f"{prefix}Allocated {plan['used']:g} GB of {plan['disk']:g} GB  ·  "
-                                f"{cmb_storage.get()}  ·  {cmb_distro.get()}",
-                           foreground="#c0392b" if plan["lab"] else "")
+        lbl_summary.config(
+            text=f"{prefix}{plan['standard']}  ·  Allocated {plan['used']:g} GB of "
+                 f"{plan['disk']:g} GB  ·  {plan['storage']}  ·  {plan['distro']}",
+            foreground="#c0392b" if plan["lab"] else "")
 
         txt_notes.configure(state="normal")
         txt_notes.delete("1.0", "end")
@@ -416,8 +497,8 @@ def run_gui():
     btn_copy.pack()
 
     # Recalculate whenever a choice changes, and on Enter.
-    cmb_distro.bind("<<ComboboxSelected>>", lambda e: calculate_clicked(quiet=True))
-    cmb_storage.bind("<<ComboboxSelected>>", lambda e: calculate_clicked(quiet=True))
+    for cmb in (cmb_standard, cmb_distro, cmb_storage):
+        cmb.bind("<<ComboboxSelected>>", lambda e: calculate_clicked(quiet=True))
     root.bind("<Return>", calculate_clicked)
 
     calculate_clicked(quiet=True)

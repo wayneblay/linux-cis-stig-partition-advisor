@@ -5,7 +5,8 @@ server. It keeps the directories that CIS Benchmarks and DISA STIGs expect on
 their own filesystems (`/tmp`, `/var`, `/var/tmp`, `/var/log`, `/var/log/audit`,
 `/home`) and sizes them to fit your disk.
 
-Pick your distribution, LVM or standard partitions, disk size and RAM. The app
+Pick DISA STIG, CIS Level 1 or CIS Level 2, then your distribution, LVM or
+standard partitions, disk size and RAM. The app
 gives you sizes, mount options and installer tips, and you can copy the whole
 plan to paste into a ticket or build notes.
 
@@ -28,7 +29,15 @@ plan to paste into a ticket or build notes.
   a 20 GB test VM). The app still lays out every CIS/STIG partition with the
   correct mount options, shrinking volumes and swap to fit, and shows a red
   **TEST / LAB** warning that 50–60 GB is the practical minimum for a real server.
-- **Swap from RAM.** 2× RAM up to 2 GB, equal to RAM up to 8 GB, 4 GB above that.
+- **STIG or CIS.** Choose DISA STIG, CIS Level 1 Server or CIS Level 2 Server.
+  A Requirement column shows which partitions each standard requires (CIS Level 1
+  only requires a separate `/tmp`; the rest are Level 2 items). STIG gives
+  `/var/log/audit` more room and adds STIG-specific notes (audit retention,
+  FIPS, encryption). Hardening tips include the matching OpenSCAP or Ubuntu
+  Security Guide profile (`stig`, `cis_server_l1`, `cis`, `cis_level1_server`…).
+- **Modern swap.** A small fixed swap as a safety cushion: 2 GB, or 4 GB with
+  16 GB+ of RAM. Neither CIS nor STIG sets a swap size. Type your own size in
+  the Swap box, or 0 for no swap.
 - **LVM.** `/boot/efi` and `/boot` are plain partitions, everything else is a
   logical volume, and about 10% of the volume group is left free so you can
   grow volumes later with `lvextend`.
@@ -38,9 +47,9 @@ plan to paste into a ticket or build notes.
 
 | Mount point      | Normal minimum | Mount options          |
 |------------------|----------------|------------------------|
-| /boot/efi        | 1 GB    | umask=0077             |
+| /boot/efi        | 1 GB    | umask=0077 (+nosuid for STIG) |
 | /boot            | 1 GB    | nodev,nosuid           |
-| swap             | from RAM| –                      |
+| swap             | 2–4 GB  | –                      |
 | /                | 10 GB   | defaults               |
 | /home            | 2 GB    | nodev,nosuid           |
 | /tmp             | 2 GB    | nodev,nosuid,noexec    |
@@ -76,8 +85,8 @@ You don't build it yourself. GitHub Actions does it on a Windows machine using
 - **To publish a release anyone can download**, tag a version and push the tag:
 
   ```
-  git tag v1.2.0
-  git push origin v1.2.0
+  git tag v1.3.0
+  git push origin v1.3.0
   ```
 
   Or, on GitHub, click **Releases → Draft a new release**, type a new tag such
