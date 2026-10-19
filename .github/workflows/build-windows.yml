@@ -1,0 +1,48 @@
+name: Build Windows app
+
+# Builds PartitionAdvisor.exe on GitHub's Windows machines.
+#  - Every push to main: the .exe is attached to the workflow run (Actions tab).
+#  - Every tag starting with "v" (e.g. v1.1.0): the .exe is published on the
+#    Releases page, where anyone can download it without a GitHub account.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build .exe
+        run: pyinstaller --onefile --windowed --name PartitionAdvisor partition_advisor.py
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PartitionAdvisor-windows
+          path: dist/PartitionAdvisor.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PartitionAdvisor.exe
+          generate_release_notes: true
