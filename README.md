@@ -80,6 +80,9 @@ You don't build it yourself. GitHub Actions does it on a Windows machine using
   git push origin v1.2.0
   ```
 
+  Or, on GitHub, click **Releases → Draft a new release**, type a new tag such
+  as `v1.3.0`, and click **Publish release**.
+
   A few minutes later `PartitionAdvisor.exe` appears on the Releases page.
 
 **If you forked this repo:** GitHub turns Actions off in forks by default. Open

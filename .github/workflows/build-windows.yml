@@ -2,13 +2,16 @@ name: Build Windows app
 
 # Builds PartitionAdvisor.exe on GitHub's Windows machines.
 #  - Every push to main: the .exe is attached to the workflow run (Actions tab).
-#  - Every tag starting with "v" (e.g. v1.1.0): the .exe is published on the
-#    Releases page, where anyone can download it without a GitHub account.
+#  - Every tag starting with "v" (e.g. v1.2.0), or a release created on the
+#    GitHub website: the .exe is published on the Releases page, where anyone
+#    can download it without a GitHub account.
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  release:
+    types: [published]
   pull_request:
   workflow_dispatch:
 
@@ -45,4 +48,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/PartitionAdvisor.exe
-          generate_release_notes: true
+          generate_release_notes: ${{ github.event_name == 'push' }}
